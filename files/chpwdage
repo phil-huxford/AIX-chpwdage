@@ -1,0 +1,203 @@
+#!/usr/bin/env ksh93
+
+system_user_file=
+
+########################################
+
+today=$(date +%b_%d_%Y)
+today_space=$(date | awk '{print $2, $3, $6}')
+log_location="/var/log/chpwdage/$today"
+all_users=
+user_list=
+user_file=
+
+no_sys_users() {
+	printf -- '%s\n' "No system user list found, please see the man page."
+    exit 1
+}
+
+
+finish() {
+	chmod 444 "$log_location" 2> /dev/null
+    if [ -z "$all_users" ] ; then
+        rm user_list 2> /dev/null
+    fi
+    if [ -z "$user_list" ] ; then 
+        rm all_users 2> /dev/null
+    fi
+}
+trap finish exit
+
+confirm() {
+  printf -- '%s ' "${*:-Continue} [Y/N]?"
+  read -r 
+  printf -- '%s\n' ""
+  case "${REPLY}" in
+    ([yY]|[yY][eE][sS]) return 0 ;;
+    (*)                 return 1 ;;
+  esac
+}
+
+while getopts :hie opt ; do
+	case $opt in
+		(h)
+			man "${0##*/}"
+			exit 0
+        ;;
+		(i)
+			if [ -z "$system_user_file" ] ; then
+                no_sys_users
+            else
+                include_system_users=true
+            fi
+        ;;
+		(e)
+            if [ -z "$system_user_file" ] ; then
+                no_sys_users
+            else
+                include_system_users=
+            fi
+        ;;
+		(\?)
+            printf -- '%s\n' "Unexpected flag. Please see the man page."
+			exit 1
+        ;;
+	esac
+done
+
+printf -- '%s\n' "YOU ARE ATTEMPTING TO RESET PASSWORDS!"
+if confirm "Do you want to continue?" ; then
+	:
+else
+	printf -- '%s\n' "Do not continue. Exiting..."
+	exit 1
+fi
+
+# If a system user list is specified, and no arguments were passed, ask about including system users. 
+if (( OPTIND == 1 )) ; then
+    if [[ -n "$system_user_file" ]] ; then
+        if confirm "Do you want to include SYSTEM USERS?" ; then
+            include_system_users=true
+            printf -- '%s\n' "System users will be included."
+        else
+            include_system_users=
+            printf -- '%s\n' "System users will not be included."
+        fi
+	else
+		include_system_users=
+    fi
+fi
+
+
+# Gathers all users on the system and stores them in an array
+lsuser ALL > all_users
+user_file="all_users"
+user_list="user_list"
+
+while IFS= read -r line ; do
+	printf -- '%s\n' "$line" | awk '{print $1}' >> user_list 
+done < "$user_file"
+
+rm all_users
+chmod 777 user_list
+
+set -A user_array 
+c=0
+while read -r line ; do
+	user_array[c]=$(printf -- '%s\n' "$line")
+	(( c=c+1 )) || true
+done < user_list
+rm user_list
+
+
+# This if block will remove system users from the list of all users 
+if [ -z "$include_system_users" ] ; then
+
+    # Builds array of system users
+	set -A system_users
+	c=0
+	while read -r line ; do
+		system_users[c]=$(printf -- '%s\n' "$line")
+		(( c=c+1 )) || true
+	done < "$system_user_file"
+
+    # Turns the array of all users into a temporary associative array
+	typeset -A tmp
+	for elem in "${user_array[@]}" ; do
+		tmp[$elem]=1
+	done
+
+    # Removes system users from the temp array
+	for elem in "${system_users[@]}" ; do
+		unset "tmp[$elem]"
+	done
+
+    # Assigns the temporary array to the user array
+	user_array=( "${!tmp[@]}" ) 
+fi
+
+
+# Gets the lastupdate time and assigns the unix timestamp to the user
+typeset -A last_update
+for username in "${user_array[@]}" ; do
+	unix_stamp=
+	unix_stamp=$(pwdadm -q "$username" | awk '/lastupdate/ {print $3}')
+	if [ -n "$unix_stamp" ] ; then
+		last_update[$username]=$unix_stamp
+	else
+		last_update[$username]=Never
+	fi
+done
+
+
+timestamp=
+while true ; do
+	printf -- '%s\n' "Reset passwords from Epoch/Unix time or ALL USERS NOW? (time/ALL)"
+	read -r date_answer
+	case $date_answer in
+		time)
+			while true; do
+			printf -- '%s\n' "Please enter the Epoch/Unix timestamp:"
+			read -r timestamp
+			date_conf=$(perl -le "print scalar(localtime($timestamp))")
+			printf -- '%s\n' ""
+			printf -- '%s\n' "Force reset of all users who have not cahnged their password since:"
+			printf -- '%s\n' "$date_conf"
+			if confirm "Is this correct?" ; then
+				break 2
+			else
+				: >&2
+			fi
+			done	
+		;;
+		ALL)
+			break
+		;;
+		*)
+			printf -- '%s\n' "Invalid Selection" >&2
+		;;
+	esac	
+done
+
+
+touch "$log_location"
+chmod 777 "$log_location"
+printf -- '%s\n' "Writing report to $log_location"
+printf -- '%s\n' "These users have been flagged for reset on $today_space" >> "$log_location"
+if [ -n "$timestamp" ] ; then
+		printf -- '%s\n' "Flagging users who's password was last reset before $date_conf"
+fi
+for i in "${!last_update[@]}" ; do
+	if [ -n "$timestamp" ] ; then
+		if [ "${last_update[$i]}" == "Never" ] || [ "${last_update[$i]}" -lt  "$timestamp" ] ; then
+			pwdadm -f ADMCHG $i
+			printf -- '%s\n' "$i" >> "$log_location"
+		fi	
+	fi
+	if [ -z "$timestamp" ] ; then
+		pwdadm -f ADMCHG $i
+		printf -- '%s\n' "$i" >> "$log_location"
+	fi
+done 
+
+exit 0
